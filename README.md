@@ -155,6 +155,10 @@ During preprocessing:
 - Missing or invalid `price` values become `0`.
 - The data explorer hides `user_session` to keep the matrix table focused on business-readable fields.
 
+## Storage Efficiency
+
+Uploaded CSV files are automatically deleted from the `uploads/` folder once the Celery worker finishes loading data into DuckDB. This means the raw file never lingers on disk after ingestion — only the structured, queryable DuckDB representation is retained. This keeps the storage footprint minimal by design, without any manual cleanup step required.
+
 ## Partial Failure Handling
 
 - Upload failures are marked immediately in Redis.
@@ -164,13 +168,23 @@ During preprocessing:
 - If Ollama cannot generate a usable NL SQL plan, the backend falls back to a small set of safe heuristic queries.
 - Generated SQL is rejected unless it is a `SELECT`, targets `events`, includes the active `job_id`, and avoids write/admin keywords.
 
-## Trade-Offs
+## Future Enhancements
 
-- Redis stores progress and anomaly JSON with a 24-hour TTL. For a production system, this would move to durable metadata tables.
-- CSV upload is saved before Celery starts. For very large files, direct-to-object-storage upload plus resumable chunks would be stronger.
-- DuckDB is excellent for local analytics, but concurrent writes should be serialized in production. This assessment worker is intended to run with limited concurrency.
-- The NL query guard is intentionally conservative. Relative time prompts are anchored to the latest timestamp in the uploaded job because sample datasets are often historical. A production version would use a SQL parser such as `sqlglot`, stronger semantic validation, and query cost limits.
-- Data explorer filtering is server-side for the core assessment fields. Sorting, saved dashboard cards, and filter presets would be natural next steps.
+> **Note:** Given more time beyond the 24-hour machine task window, the following enhancements would be the next priorities.
+
+### Authentication & Security
+
+- **OAuth 2.0 / Social Login** — Replace the current username/password flow with OAuth providers (Google, GitHub, Microsoft) using an OpenID Connect library such as `authlib`. This removes credential management from the app entirely and improves security posture.
+
+### Database
+
+- **Migrate from DuckDB to PostgreSQL (or a cloud warehouse)** — DuckDB is an excellent fit for local analytical workloads. Moving to PostgreSQL (with `asyncpg`) or a managed cloud data warehouse (BigQuery, Snowflake, Redshift) would unlock multi-user concurrency, durable storage, row-level permissions, and horizontal scaling without changing the SQL interface significantly.
+
+### AI & Analytics
+
+- **Conversational Chatbot Assistant** — Evolve the current one-shot NL-to-SQL prompt into a stateful multi-turn chat assistant with conversation history, follow-up clarification, and context-aware suggestions. This would use a message thread per job stored in Redis or PostgreSQL.
+- **Per-Chart AI Assistant** — Add an inline "Ask about this chart" button to every Plotly chart card. Clicking it would open a focused prompt panel pre-seeded with the chart's SQL and data context, letting users ask for explanations, comparisons, or drill-downs without leaving the chart.
+- **Richer Insight Charts** — Add funnel charts for the view → cart → purchase conversion path, cohort retention heatmaps, time-of-day heatmaps, geographic maps if location data is present, and RFM (recency, frequency, monetary) scatter plots for customer segmentation.
 
 ## Loom Walkthrough Outline
 
