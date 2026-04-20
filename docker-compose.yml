@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  api:
+    build:
+      context: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    working_dir: /app
+    environment:
+      CODEACE_REDIS_URL: redis://redis:6379/0
+      CODEACE_CELERY_BROKER_URL: redis://redis:6379/0
+      CODEACE_CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CODEACE_OLLAMA_BASE_URL: http://host.docker.internal:11434
+      CODEACE_OLLAMA_MODEL: qwen2.5:7b
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/app/data
+      - ./backend/uploads:/app/uploads
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: ./backend
+    command: celery -A app.worker worker --loglevel=info --pool=solo
+    working_dir: /app
+    environment:
+      CODEACE_REDIS_URL: redis://redis:6379/0
+      CODEACE_CELERY_BROKER_URL: redis://redis:6379/0
+      CODEACE_CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CODEACE_OLLAMA_BASE_URL: http://host.docker.internal:11434
+      CODEACE_OLLAMA_MODEL: qwen2.5:7b
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/data:/app/data
+      - ./backend/uploads:/app/uploads
+    depends_on:
+      - redis
+
+volumes:
+  redis-data:
