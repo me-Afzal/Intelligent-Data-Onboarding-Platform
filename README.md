@@ -31,6 +31,10 @@ Authenticated users can manage their accounts directly within the platform. This
 
 ## Architecture
 
+The diagram below shows the full system architecture — how the frontend, FastAPI backend, Celery worker, Redis, DuckDB, and Ollama fit together.
+
+![System Architecture](systemArchitecture/system_architecture.svg)
+
 ```text
 frontend/ React + Plotly
     |
@@ -48,6 +52,29 @@ Celery worker ----> DuckDB file: backend/data/ecommerce.duckdb
     v
 Ollama qwen2.5:7b for NL SQL plans and anomaly report text
 ```
+
+---
+
+## Workflows
+
+### Natural Language Query & Anomaly Detection Workflow
+
+The diagram below traces the two core AI-powered flows end-to-end: how a plain-English question becomes a validated SQL query and rendered chart, and how IQR anomaly detection feeds into an Ollama-generated narrative report.
+
+![NL Query and Anomaly Workflow](systemArchitecture/nl_query_and_anomaly_workflow.svg)
+
+**Natural Language Query flow:**
+1. The user types a question in the dashboard prompt panel.
+2. FastAPI forwards the prompt along with the DuckDB schema and active `job_id` to Ollama `qwen2.5:7b`.
+3. Ollama returns a SQL plan and a suggested chart type.
+4. The backend validates the SQL — it must be a `SELECT`, target the `events` table, include the `job_id` filter, and contain no write or admin keywords.
+5. Valid SQL is executed against DuckDB and the result rows plus chart metadata are returned to the frontend, which renders the appropriate Plotly chart.
+
+**Anomaly Detection flow:**
+1. After ingestion completes, the Celery worker runs IQR analysis on the `price` column (1.5 × IQR bounds).
+2. Anomalous rows are sampled (up to 50) with only business-relevant fields: `event_time`, `event_type`, `category_code`, `brand`, `price`, and `anomaly_value`.
+3. The sample and a summary are sent to Ollama, which generates a concise business-facing narrative report with likely causes and suggested next steps.
+4. Both the raw anomaly rows and the AI report are stored in Redis and surfaced in the Anomalies panel of the dashboard.
 
 ---
 
@@ -86,6 +113,9 @@ machine_task/
       api.js
       styles.css
     package.json
+  systemarchitecture/
+    system_architecture.svg           Full system architecture diagram
+    nl_query_and_anomaly_workflow.svg NL query and anomaly detection workflow
   docker-compose.yml
 ```
 
