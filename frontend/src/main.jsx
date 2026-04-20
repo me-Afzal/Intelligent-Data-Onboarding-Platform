@@ -1,3 +1,4 @@
+// React application entry point — mounts the root App component into #root.
 import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.jsx";

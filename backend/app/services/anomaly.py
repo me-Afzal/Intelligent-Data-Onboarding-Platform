@@ -1,3 +1,14 @@
+"""
+IQR-based anomaly detection for numeric event columns.
+
+Uses the standard 1.5 × IQR fence: values below Q1 − 1.5·IQR or above
+Q3 + 1.5·IQR are flagged. Only 'price' is checked; identifier columns
+(product_id, user_id) are excluded because large ID values aren't anomalies.
+
+After detection, an AI narrative report is generated via Ollama. If Ollama is
+unavailable the numeric results are still returned with a fallback message.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +21,11 @@ from app.services.ollama import OllamaError, generate_text
 
 
 def detect_iqr_anomalies(conn: duckdb.DuckDBPyConnection, job_id: str) -> dict[str, Any]:
+    """Run IQR anomaly detection on all NUMERIC_COLUMNS for the given job.
+
+    Returns a dict with total_anomaly count, per-column stats (bounds, sample rows),
+    and an AI-generated report string.
+    """
     columns: list[dict[str, Any]] = []
     total_anomalies = 0
 
@@ -45,6 +61,8 @@ def detect_iqr_anomalies(conn: duckdb.DuckDBPyConnection, job_id: str) -> dict[s
             [job_id, lower, upper],
         ).fetchone()[0]
 
+        # Order sample rows by distance from the median so the most extreme
+        # outliers appear first in the AI prompt and the anomaly panel.
         sample = conn.execute(
             f"""
             SELECT event_time, event_type, category_code, brand, price, {column} AS anomaly_value
@@ -78,6 +96,13 @@ def detect_iqr_anomalies(conn: duckdb.DuckDBPyConnection, job_id: str) -> dict[s
 
 
 def build_anomaly_report(job_id: str, columns: list[dict[str, Any]], total_anomalies: int) -> str:
+    """Generate a plain-text business narrative for the anomaly findings via Ollama.
+
+    Passes a trimmed JSON summary (bounds, counts, up to 50 sample rows per column)
+    to the LLM so it can produce concrete observations without inventing data.
+    Returns a fallback string if Ollama is unreachable so the API response is
+    always complete even without the AI layer.
+    """
     summary = [
         {
             "column": item["column"],
@@ -116,6 +141,11 @@ Total anomaly rows across column checks: {total_anomalies}
 
 
 def trim_anomaly_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Strip a raw anomaly row down to the fields relevant for the AI prompt.
+
+    Excludes product_id, user_id, and user_session because they add noise
+    without helping the LLM form business-meaningful observations.
+    """
     return {
         "event_time": row.get("event_time"),
         "event_type": row.get("event_type"),

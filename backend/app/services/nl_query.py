@@ -1,3 +1,16 @@
+"""
+Natural language to DuckDB SQL translation service.
+
+Flow: the user's prompt is sent to Ollama which returns a query plan (SQL +
+chart metadata). The plan is validated and, if Ollama returned something
+unsafe or semantically wrong, a rule-based fallback plan is used instead.
+
+Safety rules enforced in validate_sql:
+  - Only SELECT / WITH queries are allowed.
+  - A job_id isolation filter must be present to prevent cross-job data leaks.
+  - A LIMIT is appended automatically if the query omits one.
+"""
+
 from __future__ import annotations
 
 import re
@@ -10,10 +23,19 @@ from app.config import get_settings
 from app.services.ollama import OllamaError, generate_json
 
 
+# Blocks any DML/DDL keywords that would mutate the database if the LLM generates
+# them despite the system prompt instructing otherwise.
 BLOCKED_SQL = re.compile(r"\b(insert|update|delete|drop|alter|create|copy|attach|detach|pragma|call)\b", re.IGNORECASE)
 
 
 def answer_prompt(conn: duckdb.DuckDBPyConnection, job_id: str, prompt: str) -> dict[str, Any]:
+    """Translate a natural-language prompt into a SQL result set with chart metadata.
+
+    Tries Ollama first. If the plan fails validation or is semantically wrong
+    (detected by should_use_fallback), switches to the rule-based fallback.
+    NaN values are replaced with None before JSON serialisation because pandas
+    NaN is not valid JSON.
+    """
     plan = create_query_plan(job_id, prompt)
     try:
         if should_use_fallback(prompt, plan.get("sql", "")):
@@ -38,6 +60,13 @@ def answer_prompt(conn: duckdb.DuckDBPyConnection, job_id: str, prompt: str) -> 
 
 
 def create_query_plan(job_id: str, user_prompt: str) -> dict[str, Any]:
+    """Ask Ollama to produce a JSON query plan (sql, chart_type, title, x, y).
+
+    The system prompt provides the table schema and instructs the model to
+    anchor relative date ranges to the latest event_time in the job rather
+    than CURRENT_DATE, which would be wrong for historical datasets.
+    Falls back to fallback_plan if Ollama is unreachable or returns malformed output.
+    """
     settings = get_settings()
     schema = """
 Table: events
@@ -83,6 +112,13 @@ User question: {user_prompt}
 
 
 def fallback_plan(job_id: str, user_prompt: str) -> dict[str, str | None]:
+    """Return a hard-coded query plan for common prompt patterns without using Ollama.
+
+    Covers the most frequent question types: weekly revenue, daily revenue,
+    brand purchases/revenue, category breakdown, and a generic events-by-type
+    catch-all. Date ranges are anchored to MAX(event_time) in the job so the
+    queries work correctly on historical CSV files.
+    """
     normalized = user_prompt.lower()
     asks_revenue = any(word in normalized for word in ["revenue", "earned", "sales", "income"])
     asks_week = "week" in normalized
@@ -181,6 +217,15 @@ def fallback_plan(job_id: str, user_prompt: str) -> dict[str, str | None]:
 
 
 def should_use_fallback(user_prompt: str, sql: str) -> bool:
+    """Detect known LLM errors that produce silently wrong results.
+
+    Three common failure modes:
+    1. LLM uses DATE_TRUNC('month') when the user asked about a week.
+    2. LLM uses CURRENT_DATE instead of anchoring to the latest event_time in
+       the job, which breaks queries on historical datasets.
+    3. LLM forgets to filter event_type = 'purchase' for revenue questions,
+       summing price across all event types and inflating the figure.
+    """
     normalized = user_prompt.lower()
     lowered_sql = sql.lower()
     if "week" in normalized and "date_trunc('month'" in lowered_sql:
@@ -193,6 +238,17 @@ def should_use_fallback(user_prompt: str, sql: str) -> bool:
 
 
 def validate_sql(sql: str, job_id: str) -> str:
+    """Validate and sanitise an AI-generated SQL string before execution.
+
+    Checks performed:
+    - Must be a SELECT or WITH (CTE) statement.
+    - Must not contain any DML/DDL keywords from BLOCKED_SQL.
+    - Must reference the 'events' table.
+    - Must contain the literal job_id to enforce row-level isolation.
+    - LIMIT is appended automatically if absent to cap result size.
+
+    Raises ValueError with a descriptive message on any violation.
+    """
     compact = sql.strip().rstrip(";")
     if not (compact.lower().startswith("select") or compact.lower().startswith("with")):
         raise ValueError("Only SELECT queries are allowed.")
@@ -208,6 +264,11 @@ def validate_sql(sql: str, job_id: str) -> str:
 
 
 def make_json_safe(value: Any) -> Any:
+    """Convert non-JSON-serialisable types returned by DuckDB to safe Python types.
+
+    Timestamps and dates expose .isoformat(); all other types are returned as-is
+    since standard Python scalars (int, float, str, None) are already JSON-safe.
+    """
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return value

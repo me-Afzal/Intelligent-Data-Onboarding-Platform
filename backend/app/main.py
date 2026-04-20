@@ -1,3 +1,11 @@
+"""
+FastAPI application entry point for Codeace.
+
+Exposes REST endpoints for CSV upload, job status polling, event/metrics/anomaly
+queries, and the AI natural-language query endpoint. A WebSocket endpoint streams
+live job-progress updates so the frontend doesn't need to poll.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -26,12 +34,14 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure the SQLite users table exists before the first request arrives.
     ensure_user_schema()
     yield
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
+# Allow the Vite dev server to reach the API during local development.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -49,6 +59,7 @@ class PromptRequest(BaseModel):
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
+    """Simple liveness probe used by Docker health-checks and load balancers."""
     return {"status": "ok"}
 
 
@@ -57,6 +68,12 @@ async def upload_csv(
     file: UploadFile = File(...),
     _: dict = Depends(get_current_user),
 ) -> dict[str, str]:
+    """Accept a CSV upload, stream it to disk, then enqueue the Celery processing task.
+
+    Returns the job_id immediately so the client can open a WebSocket to track
+    progress without waiting for the file to be fully processed. The file is
+    streamed in 1 MB chunks to avoid loading large CSVs into memory.
+    """
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a CSV file.")
 
@@ -82,6 +99,10 @@ async def job_status(
     job_id: str,
     _: dict = Depends(get_current_user),
 ) -> dict:
+    """Return the current Redis state blob for a job (status, progress, stage, etc.).
+
+    Used by clients that prefer polling over WebSocket streaming.
+    """
     state = get_job_state(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -94,6 +115,13 @@ async def job_progress(
     job_id: str,
     token: str = Query(default=""),
 ) -> None:
+    """Stream live job-progress updates to the client over a WebSocket connection.
+
+    Authentication is done via a JWT query parameter because browsers cannot
+    send custom headers in WebSocket handshakes. The connection polls Redis
+    every 0.75 s and only sends a frame when the state has changed.
+    Closes with code 4001 if the token is invalid or expired.
+    """
     if not authenticate_ws_token(token):
         await websocket.close(code=4001)
         return
@@ -103,9 +131,12 @@ async def job_progress(
         while True:
             state = get_job_state(job_id) or {"job_id": job_id, "status": "unknown"}
             encoded = json.dumps(state, default=str)
+            # Only push a frame when state actually changed to avoid redundant traffic.
             if encoded != previous:
                 await websocket.send_text(encoded)
                 previous = encoded
+            # Keep the connection open one extra tick after terminal states so the
+            # client receives the final frame before we stop polling.
             if state.get("status") in {"completed", "failed"}:
                 await asyncio.sleep(1)
             await asyncio.sleep(0.75)
@@ -118,6 +149,12 @@ async def metrics(
     job_id: str,
     _: dict = Depends(get_current_user),
 ) -> dict:
+    """Return pre-computed analytics for the dashboard: totals, top brands/categories,
+    revenue trend by month, and cart-to-purchase conversion rates by brand.
+
+    All revenue figures count only 'purchase' events. Brands/categories are
+    capped at 15 rows each to keep the response size bounded.
+    """
     require_completed_or_processing(job_id)
     with duckdb_connection() as conn:
         totals = conn.execute(
@@ -254,6 +291,13 @@ async def events(
     end_time: str | None = None,
     _: dict = Depends(get_current_user),
 ) -> dict:
+    """Return a paginated, filterable view of raw events for the Data Explorer.
+
+    Filters are applied as parameterised SQL predicates to prevent injection.
+    The response also includes the full date range and distinct brand/category
+    lists so the frontend can populate its filter dropdowns in one request.
+    end_time is treated as inclusive by adding INTERVAL 1 DAY to the CAST date.
+    """
     require_completed_or_processing(job_id)
     offset = (page - 1) * page_size
     filters = ["job_id = ?"]
@@ -352,6 +396,12 @@ async def anomalies(
     job_id: str,
     _: dict = Depends(get_current_user),
 ) -> dict:
+    """Return the IQR anomaly detection results stored by the Celery worker.
+
+    Returns an empty result structure (not 404) when the worker hasn't written
+    anomaly state yet, so the frontend can render a 'not ready' message without
+    treating it as an error.
+    """
     state = get_anomaly_state(job_id)
     if not state:
         return {"job_id": job_id, "method": "IQR_1.5", "total_anomalies": 0, "columns": [], "report": "Anomaly results are not ready yet."}
@@ -364,6 +414,12 @@ async def ask(
     payload: PromptRequest,
     _: dict = Depends(get_current_user),
 ) -> dict:
+    """Translate a natural-language prompt into a DuckDB query and return the results.
+
+    Delegates to nl_query.answer_prompt which tries Ollama first, then falls
+    back to hand-written rule-based queries. ValueError means the generated SQL
+    failed validation; DuckDBException means it ran but produced a DB error.
+    """
     require_completed_or_processing(job_id)
     if not payload.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt cannot be empty.")
@@ -379,6 +435,11 @@ async def ask(
 
 
 def require_completed_or_processing(job_id: str) -> None:
+    """Guard that raises 404/409 unless the job has data available to query.
+
+    Allows queries during the 'processing' and 'analyzing' phases so partial
+    results can be explored while the worker is still ingesting rows.
+    """
     state = get_job_state(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found.")

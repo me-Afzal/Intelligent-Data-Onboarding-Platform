@@ -1,3 +1,11 @@
+/**
+ * Axios instance pre-configured for the Codeace API.
+ *
+ * The request interceptor automatically attaches the stored JWT as a Bearer
+ * token. The response interceptor catches 401s on non-auth routes, clears the
+ * token, and dispatches a 'codeace:unauthorized' DOM event so App.jsx can
+ * redirect to the login screen without coupling the interceptor to React state.
+ */
 import axios from "axios";
 
 export const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";

@@ -1,3 +1,11 @@
+"""
+DuckDB connection management and schema definition.
+
+All events from every upload job are stored in a single 'events' table,
+partitioned logically by job_id. Two indexes keep per-job filters fast
+without requiring separate tables per upload.
+"""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -19,14 +27,23 @@ EVENT_COLUMNS = [
     "user_session",
 ]
 
+# Only price is treated as a numeric signal for anomaly detection;
+# product_id and user_id are identifiers and are excluded intentionally.
 NUMERIC_COLUMNS = ["price"]
 
 
 @contextmanager
 def duckdb_connection() -> Iterator[duckdb.DuckDBPyConnection]:
+    """Open a DuckDB connection, ensure the schema exists, and close on exit.
+
+    Each call creates a fresh connection; DuckDB file-mode connections are
+    not thread-safe for concurrent writes, so the Celery worker and FastAPI
+    workers each open their own short-lived connections.
+    """
     settings = get_settings()
     conn = duckdb.connect(str(settings.database_path))
     try:
+        # Parallelise scans across 4 threads while staying single-writer.
         conn.execute("PRAGMA threads=4")
         ensure_schema(conn)
         yield conn
@@ -35,6 +52,7 @@ def duckdb_connection() -> Iterator[duckdb.DuckDBPyConnection]:
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the events table and indexes if they do not already exist."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (

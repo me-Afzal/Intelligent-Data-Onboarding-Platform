@@ -1,3 +1,14 @@
+/**
+ * Codeace single-page application.
+ *
+ * Top-level App component owns all auth and session state. Child page
+ * components (AuthPage, UploadPage, DashboardPage) receive only the slice of
+ * state they need via props — no context or global store is used.
+ *
+ * WebSocket connections are stored in wsRefs (a ref-of-map) so they survive
+ * re-renders without triggering them. Each job gets one WS connection that is
+ * closed on logout or token expiry.
+ */
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Plotly from "plotly.js-dist-min";
 import { api, wsUrl } from "./api";
@@ -258,6 +269,11 @@ export default function App() {
 
 // ─── Auth page ────────────────────────────────────────────────────────────────
 
+/**
+ * Login / registration page shown to unauthenticated users.
+ * Calls onAuth(user) with the resolved user object on success so the parent
+ * can transition to the authenticated view without a page reload.
+ */
 function AuthPage({ onAuth }) {
   const [tab, setTab] = useState("login");
   const [form, setForm] = useState({ username: "", email: "", password: "" });
@@ -353,6 +369,11 @@ function AuthPage({ onAuth }) {
 
 // ─── Settings modal ───────────────────────────────────────────────────────────
 
+/**
+ * Account settings overlay: change password, sign out, or permanently delete
+ * the account. All destructive actions require the current password to prevent
+ * abuse if a session is left open on a shared machine.
+ */
 function SettingsModal({ currentUser, onClose, onLogout }) {
   const [pwForm, setPwForm] = useState({ current_password: "", new_password: "", confirm: "" });
   const [pwMsg, setPwMsg] = useState(null); // {type: "ok"|"err", text}
@@ -489,6 +510,11 @@ function SettingsModal({ currentUser, onClose, onLogout }) {
 
 // ─── Upload page ──────────────────────────────────────────────────────────────
 
+/**
+ * Landing page for authenticated users. Accepts one or more CSV files via
+ * drag-and-drop or file picker and shows live upload progress cards.
+ * Once at least one job completes, a button appears to open its dashboard.
+ */
 function UploadPage({ sessions, uploadErrors, onUpload, onViewDashboard }) {
   const completedSessions = sessions.filter((s) => s.status === "completed");
 
@@ -587,6 +613,11 @@ function SessionCard({ session }) {
 
 // ─── Dashboard page ───────────────────────────────────────────────────────────
 
+/**
+ * Main analytics view. Composes all dashboard sections (Metrics, AI assistant,
+ * Anomalies, Events table) and the top navigation bar. When multiple datasets
+ * are loaded, a job selector dropdown lets the user switch between them.
+ */
 function DashboardPage({
   sessions, activeJobId, onChangeJob, onUploadNew, currentUser, onLogout,
   metrics, events, anomalies,
@@ -659,6 +690,7 @@ function DashboardPage({
 
 // ─── Dashboard sections ───────────────────────────────────────────────────────
 
+/** Summary KPI cards and pre-built charts for the active dataset. */
 function Metrics({ metrics }) {
   if (!metrics) return null;
   const totals = metrics.totals;
@@ -760,6 +792,14 @@ function AnswerPanel({ answer }) {
   );
 }
 
+/**
+ * Renders a Plotly chart for a given dataset. Supports bar, line, pie, scatter,
+ * and multi_line chart types. Falls back to a DataTable when chart data is
+ * insufficient or the chart type is 'table'/'metric'.
+ *
+ * fallbackY is tried when the primary y key has no non-null values, which can
+ * happen when the AI picks a column name that doesn't match the query result.
+ */
 function PlotCard({ title, rows, chartType, x, y, series, fallbackY }) {
   const plotData = useMemo(() => {
     if (!rows?.length || chartType === "table" || chartType === "metric" || !x || !y) return [];
@@ -843,6 +883,11 @@ function PlotCard({ title, rows, chartType, x, y, series, fallbackY }) {
   );
 }
 
+/**
+ * Imperative Plotly wrapper. Uses Plotly.react (diff-based update) rather than
+ * Plotly.newPlot so chart re-renders from data changes are efficient. Purges
+ * the chart on unmount to avoid memory leaks from detached DOM nodes.
+ */
 function PlotlyChart({ data, layout, config }) {
   const ref = useRef(null);
   const [renderError, setRenderError] = useState("");
@@ -875,6 +920,7 @@ function PlotlyChart({ data, layout, config }) {
   );
 }
 
+// Plotly throws if layout/config contain undefined or null values, so strip them.
 function cleanPlotlyObject(value) {
   if (Array.isArray(value)) return value.map(cleanPlotlyObject);
   if (value && typeof value === "object") {
@@ -941,6 +987,12 @@ function AnomalyPanel({ anomalies }) {
   );
 }
 
+/**
+ * Renders the Ollama-generated anomaly report as structured HTML.
+ * Strips markdown syntax (##, **, numbered lists, dashes) that the model may
+ * include despite being told to use plain text, promoting likely headings to
+ * <h3> and everything else to <p>.
+ */
 function ReportText({ text }) {
   const lines = String(text || "").split("\n").map((line) => line.trim()).filter(Boolean);
   if (!lines.length) return null;

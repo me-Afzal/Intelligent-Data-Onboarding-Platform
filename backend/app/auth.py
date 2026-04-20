@@ -1,3 +1,11 @@
+"""
+JWT authentication helpers and FastAPI dependency injection for route protection.
+
+Tokens are HS256-signed JWTs with a 24-hour expiry. Each token embeds the
+user's numeric ID and username so routes can read them without a DB round-trip,
+but get_current_user still verifies the user still exists in SQLite.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -19,14 +27,17 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 def hash_password(password: str) -> str:
+    """Return a bcrypt hash of the given plaintext password."""
     return pwd_context.hash(password)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
+    """Return True if plain matches the stored bcrypt hash."""
     return pwd_context.verify(plain, hashed)
 
 
 def create_token(user_id: int, username: str) -> str:
+    """Mint a signed JWT for the given user, valid for TOKEN_EXPIRE_HOURS."""
     payload = {
         "sub": str(user_id),
         "username": username,
@@ -36,6 +47,7 @@ def create_token(user_id: int, username: str) -> str:
 
 
 def _decode(token: str) -> dict[str, Any]:
+    """Decode and verify a JWT, raising 401 on any failure."""
     try:
         return jwt.decode(token, get_settings().secret_key, algorithms=[ALGORITHM])
     except JWTError as exc:
@@ -45,6 +57,10 @@ def _decode(token: str) -> dict[str, Any]:
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> dict[str, Any]:
+    """FastAPI dependency that resolves a Bearer token to the current user dict.
+
+    Re-checks SQLite so deleted accounts are rejected even with a valid token.
+    """
     if not credentials:
         raise HTTPException(status_code=401, detail="Authentication required.")
     payload = _decode(credentials.credentials)
