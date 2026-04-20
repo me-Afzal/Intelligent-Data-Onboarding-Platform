@@ -1,5 +1,6 @@
 backend/data/*.duckdb
 backend/data/*.wal
+backend/data/*.db
 backend/uploads/*.csv
 backend/__pycache__/
 backend/app/**/__pycache__/
