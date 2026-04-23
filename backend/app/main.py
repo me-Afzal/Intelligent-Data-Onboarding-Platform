@@ -4,6 +4,9 @@ FastAPI application entry point for Codeace.
 Exposes REST endpoints for CSV upload, job status polling, event/metrics/anomaly
 queries, and the AI natural-language query endpoint. A WebSocket endpoint streams
 live job-progress updates so the frontend doesn't need to poll.
+
+Authentication is enforced globally by JWTAuthMiddleware — individual route
+handlers do not declare auth dependencies.
 """
 
 from __future__ import annotations
@@ -15,12 +18,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiofiles
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from duckdb import Error as DuckDBException
 
-from app.auth import authenticate_ws_token, get_current_user
+from app.auth import JWTAuthMiddleware
 from app.config import get_settings
 from app.db import duckdb_connection
 from app.routers.auth import router as auth_router
@@ -34,14 +37,16 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure the SQLite users table exists before the first request arrives.
     ensure_user_schema()
     yield
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
-# Allow the Vite dev server to reach the API during local development.
+# JWTAuthMiddleware is added first so CORSMiddleware wraps it, ensuring CORS
+# headers are present even on 401 responses returned by the auth middleware.
+app.add_middleware(JWTAuthMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -64,10 +69,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/api/uploads")
-async def upload_csv(
-    file: UploadFile = File(...),
-    _: dict = Depends(get_current_user),
-) -> dict[str, str]:
+async def upload_csv(file: UploadFile = File(...)) -> dict[str, str]:
     """Accept a CSV upload, stream it to disk, then enqueue the Celery processing task.
 
     Returns the job_id immediately so the client can open a WebSocket to track
@@ -95,10 +97,7 @@ async def upload_csv(
 
 
 @app.get("/api/jobs/{job_id}")
-async def job_status(
-    job_id: str,
-    _: dict = Depends(get_current_user),
-) -> dict:
+async def job_status(job_id: str) -> dict:
     """Return the current Redis state blob for a job (status, progress, stage, etc.).
 
     Used by clients that prefer polling over WebSocket streaming.
@@ -110,33 +109,22 @@ async def job_status(
 
 
 @app.websocket("/ws/jobs/{job_id}")
-async def job_progress(
-    websocket: WebSocket,
-    job_id: str,
-    token: str = Query(default=""),
-) -> None:
+async def job_progress(websocket: WebSocket, job_id: str) -> None:
     """Stream live job-progress updates to the client over a WebSocket connection.
 
-    Authentication is done via a JWT query parameter because browsers cannot
-    send custom headers in WebSocket handshakes. The connection polls Redis
-    every 0.75 s and only sends a frame when the state has changed.
-    Closes with code 4001 if the token is invalid or expired.
+    Authentication is handled by JWTAuthMiddleware via the `token` query
+    parameter before this handler is reached. The connection polls Redis every
+    0.75 s and only sends a frame when the state has changed.
     """
-    if not authenticate_ws_token(token):
-        await websocket.close(code=4001)
-        return
     await websocket.accept()
     previous = None
     try:
         while True:
             state = get_job_state(job_id) or {"job_id": job_id, "status": "unknown"}
             encoded = json.dumps(state, default=str)
-            # Only push a frame when state actually changed to avoid redundant traffic.
             if encoded != previous:
                 await websocket.send_text(encoded)
                 previous = encoded
-            # Keep the connection open one extra tick after terminal states so the
-            # client receives the final frame before we stop polling.
             if state.get("status") in {"completed", "failed"}:
                 await asyncio.sleep(1)
             await asyncio.sleep(0.75)
@@ -145,10 +133,7 @@ async def job_progress(
 
 
 @app.get("/api/jobs/{job_id}/metrics")
-async def metrics(
-    job_id: str,
-    _: dict = Depends(get_current_user),
-) -> dict:
+async def metrics(job_id: str) -> dict:
     """Return pre-computed analytics for the dashboard: totals, top brands/categories,
     revenue trend by month, and cart-to-purchase conversion rates by brand.
 
@@ -289,7 +274,6 @@ async def events(
     max_price: float | None = Query(None, ge=0),
     start_time: str | None = None,
     end_time: str | None = None,
-    _: dict = Depends(get_current_user),
 ) -> dict:
     """Return a paginated, filterable view of raw events for the Data Explorer.
 
@@ -392,10 +376,7 @@ async def events(
 
 
 @app.get("/api/jobs/{job_id}/anomalies")
-async def anomalies(
-    job_id: str,
-    _: dict = Depends(get_current_user),
-) -> dict:
+async def anomalies(job_id: str) -> dict:
     """Return the IQR anomaly detection results stored by the Celery worker.
 
     Returns an empty result structure (not 404) when the worker hasn't written
@@ -409,11 +390,7 @@ async def anomalies(
 
 
 @app.post("/api/jobs/{job_id}/ask")
-async def ask(
-    job_id: str,
-    payload: PromptRequest,
-    _: dict = Depends(get_current_user),
-) -> dict:
+async def ask(job_id: str, payload: PromptRequest) -> dict:
     """Translate a natural-language prompt into a DuckDB query and return the results.
 
     Delegates to nl_query.answer_prompt which tries Ollama first, then falls

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
-from app.auth import create_token, get_current_user, hash_password, verify_password
+from app.auth import create_token, hash_password, verify_password
 from app.userdb import user_db
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -32,7 +32,6 @@ class RegisterRequest(BaseModel):
     @field_validator("username")
     @classmethod
     def _check_username(cls, v: str) -> str:
-        """Strip and enforce a minimum username length of 3 characters."""
         v = v.strip()
         if len(v) < 3:
             raise ValueError("Username must be at least 3 characters.")
@@ -41,7 +40,6 @@ class RegisterRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def _check_password(cls, v: str) -> str:
-        """Enforce a minimum password length of 6 characters at the model level."""
         if len(v) < 6:
             raise ValueError("Password must be at least 6 characters.")
         return v
@@ -55,10 +53,7 @@ class LoginRequest(BaseModel):
 
 
 class UpdatePasswordRequest(BaseModel):
-    """Payload for PUT /api/auth/password.
-
-    Requires both the current password (for verification) and the new password.
-    """
+    """Payload for PUT /api/auth/password."""
 
     current_password: str
     new_password: str
@@ -66,7 +61,6 @@ class UpdatePasswordRequest(BaseModel):
     @field_validator("new_password")
     @classmethod
     def _check_new(cls, v: str) -> str:
-        """Enforce minimum length on the new password before it reaches the handler."""
         if len(v) < 6:
             raise ValueError("New password must be at least 6 characters.")
         return v
@@ -96,8 +90,6 @@ def register(payload: RegisterRequest) -> dict[str, Any]:
             conn.commit()
             user_id = cursor.lastrowid
         except Exception:
-            # SQLite UNIQUE constraint violations surface as a generic Exception here;
-            # treat any insert failure as a duplicate username/email conflict.
             raise HTTPException(status_code=409, detail="Username or email already registered.")
     return {"access_token": create_token(user_id, payload.username), "token_type": "bearer"}
 
@@ -120,25 +112,19 @@ def login(payload: LoginRequest) -> dict[str, Any]:
 
 
 @router.get("/me")
-def me(current_user: dict = Depends(get_current_user)) -> dict[str, Any]:
+def me(request: Request) -> dict[str, Any]:
     """Return the profile of the currently authenticated user.
 
     Used by the frontend on startup to validate a stored token and hydrate
     the user display name without prompting for login again.
     """
-    return current_user
+    return request.scope["_auth_user"]
 
 
 @router.put("/password")
-def update_password(
-    payload: UpdatePasswordRequest,
-    current_user: dict = Depends(get_current_user),
-) -> dict[str, str]:
-    """Change the authenticated user's password after verifying the current one.
-
-    Re-fetches the stored hash rather than trusting the token payload because
-    the token doesn't carry the hashed password.
-    """
+def update_password(payload: UpdatePasswordRequest, request: Request) -> dict[str, str]:
+    """Change the authenticated user's password after verifying the current one."""
+    current_user = request.scope["_auth_user"]
     with user_db() as conn:
         row = conn.execute(
             "SELECT hashed_password FROM users WHERE id = ?", [current_user["id"]]
@@ -154,10 +140,7 @@ def update_password(
 
 
 @router.delete("/account")
-def delete_account(
-    payload: DeleteAccountRequest,
-    current_user: dict = Depends(get_current_user),
-) -> dict[str, str]:
+def delete_account(payload: DeleteAccountRequest, request: Request) -> dict[str, str]:
     """Permanently delete the authenticated user's account.
 
     Password re-confirmation is required as a second factor to protect against
@@ -165,6 +148,7 @@ def delete_account(
     Note: associated job data in DuckDB and Redis is not purged here; it
     expires naturally via the Redis TTL and is isolated by job_id.
     """
+    current_user = request.scope["_auth_user"]
     with user_db() as conn:
         row = conn.execute(
             "SELECT hashed_password FROM users WHERE id = ?", [current_user["id"]]
